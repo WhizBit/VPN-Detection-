@@ -5,28 +5,62 @@ Real-time network intrusion detection: a live packet sniffer turns raw traffic i
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Capture["Capture — flow_sniffer.py"]
-        NIC[Network Interface] --> Sniffer["FlowSniffer\nScapy AsyncSniffer"]
-        Sniffer -->|per packet| Agg["Flow aggregation\nkeyed by 5-tuple"]
-        Agg -->|idle > 5s| Stats["calculate_stats\nduration, IAT, pkt lengths, TCP flags"]
-        Stats --> Queue[("thread-safe Queue")]
+flowchart TD
+    NIC(["🌐 Network Interface<br/>live traffic"])
+
+    subgraph CAP[" 1 · CAPTURE  —  flow_sniffer.py "]
+        direction TD
+        Sniffer["<b>FlowSniffer</b><br/>Scapy AsyncSniffer<br/><i>background thread, per packet</i>"]
+        Agg["<b>Flow aggregation</b><br/>packets grouped by canonical<br/>(src IP, dst IP, src port, dst port, proto)"]
+        Expire{{"Flow idle<br/>&gt; 5 seconds?"}}
+        Stats["<b>calculate_stats()</b><br/>~40 CICFlowMeter-style features:<br/>packet-length stats · inter-arrival times<br/>TCP flag counts · header lengths · byte/pkt rates"]
+        Sniffer --> Agg --> Expire
+        Expire -->|"yes — expire &amp; finalize"| Stats
+        Expire -.->|"no — keep buffering"| Agg
     end
 
-    subgraph Processing["Processing — flow_processor.py"]
-        Queue --> Proc[FlowProcessor]
-        Proc --> ML["MLModelPredictor\nRF / XGBoost / GradBoost / NeuralNet / KNN"]
-        ML -->|"confidence ≥ 0.7 and not malicious"| Done1[Final verdict: benign/labeled]
-        ML -->|"low confidence, 'Other', or malicious"| LLM["LLMAnalyzer\nGroq llama-3.1-8b-instant"]
-        LLM --> CSV[("llm_analyzed_flows.csv\naudit log")]
-        LLM --> Done2["Final verdict + attack type + explanation"]
+    Queue[("🗂️ thread-safe Queue<br/>one dict per completed flow")]
+
+    subgraph PROC[" 2 · PROCESSING  —  flow_processor.py "]
+        direction TD
+        Predictor["<b>MLModelPredictor</b><br/>choose 1 of 5 models live:<br/>RandomForest · XGBoost · GradientBoosting<br/>Neural Network (Keras) · KNN"]
+        Gate{{"confidence ≥ 70%<br/>AND not malicious<br/>AND not 'Other'?"}}
+        Verdict1["✅ Final verdict<br/>ML label used as-is"]
+        LLM["<b>LLMAnalyzer</b><br/>Groq · llama-3.1-8b-instant<br/>structured JSON verdict:<br/>prediction · attack type · confidence · explanation"]
+        Verdict2["🧠 Final verdict<br/>LLM label overrides ML label"]
+        Audit[("📄 llm_analyzed_flows.csv<br/>audit log")]
+
+        Predictor --> Gate
+        Gate -->|yes| Verdict1
+        Gate -->|"no — escalate"| LLM
+        LLM --> Verdict2
+        LLM --> Audit
     end
 
-    subgraph Dashboard["Dashboard — app.py"]
-        Done1 --> UI[Streamlit App]
-        Done2 --> UI
-        UI --> Tabs["Live Dashboard · Threat Alerts · Analytics · Flow Details"]
+    subgraph DASH[" 3 · DASHBOARD  —  app.py  (Streamlit, auto-refresh 5s) "]
+        direction TD
+        UI["Sidebar: model switcher + live stats"]
+        T1["📊 Live Dashboard"]
+        T2["🚨 Threat Alerts"]
+        T3["📈 Analytics<br/>(Plotly charts)"]
+        T4["📋 Flow Details<br/>(filter · sort · drill-down)"]
+        UI --> T1 & T2 & T3 & T4
     end
+
+    NIC --> Sniffer
+    Stats --> Queue
+    Queue --> Predictor
+    Verdict1 --> UI
+    Verdict2 --> UI
+
+    classDef capture fill:#1e3a5f,stroke:#4a90d9,color:#fff
+    classDef process fill:#3a1e5f,stroke:#a04ad9,color:#fff
+    classDef dash fill:#1e5f3a,stroke:#4ad98f,color:#fff
+    classDef store fill:#5f3a1e,stroke:#d9944a,color:#fff
+    class Sniffer,Agg,Expire,Stats capture
+    class Predictor,Gate,Verdict1,LLM,Verdict2 process
+    class UI,T1,T2,T3,T4 dash
+    class Queue,Audit store
 ```
 
 ## How it works
